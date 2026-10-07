@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+#
+# PVE Intel Flex GPU Dashboard Mod v4.0
+#
+# Adds Intel Data Center GPU Flex (140 / 170) monitoring to the Proxmox VE node
+# summary page, mirroring the layout of pve-gpu-dashboard-mod v3.0 (NVIDIA):
+#   - VRAM usage bar
+#   - GPU utilisation / temperature / power line
+#   - Historical Temperature / VRAM / Power charts (browser localStorage)
+#
+# Data source: `xpu-smi stats -d <id>` (Intel XPU Manager).
+#
+
+################### Configuration #############
+BACKUP_DIR=""                 # empty = ~/PVE-INTEL-FLEX-DASHBOARD
+HISTORY_MAX_POINTS=1440       # 24 h at 1-minute interval
+HISTORY_POLL_INTERVAL=60000   # ms
+##################### DO NOT EDIT BELOW #######################
+
+SCRIPT_VERSION="4.0"
+PVE_MANAGER_LIB_JS_FILE="${PVE_MANAGER_LIB_JS_FILE:-/usr/share/pve-manager/js/pvemanagerlib.js}"
+NODES_PM_FILE="${NODES_PM_FILE:-/usr/share/perl5/PVE/API2/Nodes.pm}"
+
+function msgb() { echo -e "\e[1m$1\e[0m"; }
+function info() { echo -e "\e[0;32m[info] $1\e[0m"; }
+function warn() { echo -e "\e[0;33m[warning] $1\e[0m"; }
+function err()  { echo -e "\e[0;31m[error] $1\e[0m"; exit 1; }
+
+function usage() {
+    msgb "\nPVE Intel Flex GPU Dashboard Mod v${SCRIPT_VERSION}"
+    echo "Usage: $0 [install | uninstall]"
+    exit 1
+}
+
+function check_root_privileges() {
+    [[ $EUID -ne 0 ]] && err "This script must be run as root."
+}
+
+function is_installed() {
+    grep -q 'gpuDriverVersion' "$NODES_PM_FILE" 2>/dev/null
+}
+
+############################ GPU detection ############################
+# `xpu-smi discovery` prints one table row per device:
+#   | 0 | Device Name: Intel(R) Data Center GPU Flex 170 |
+# ("Device ID" only appears in the header, so counting it always gives 1.)
+function detect_gpus() {
+    msgb "\n=== Detecting Intel Flex GPUs ==="
+
+    XPU_SMI_BIN="$(command -v xpu-smi)"
+    [[ -z "$XPU_SMI_BIN" ]] && err "xpu-smi not found. Install Intel XPU Manager first."
+    info "xpu-smi found at $XPU_SMI_BIN"
+
+    GPU_IDS=()
+    GPU_NAMES=()
+    GPU_MEMS=()
+
+    local disc id one name mem
+    disc=$("$XPU_SMI_BIN" discovery 2>/dev/null)
+    [[ -z "$disc" ]] && err "'xpu-smi discovery' returned nothing. Is the i915/xe driver loaded and the GPU visible on the host?"
+
+    for id in $(echo "$disc" | grep -oP '^\|\s*\K[0-9]+(?=\s*\|\s*Device Name:)'); do
+        one=$("$XPU_SMI_BIN" discovery -d "$id" 2>/dev/null)
+        name=$(echo "$one" | grep -oP 'Device Name:\s*\K[^|]*' | head -1 | sed 's/[[:space:]]*$//' | tr -d "'\"\\\\")
+        mem=$(echo "$one" | grep -oP 'Memory Physical Size:\s*\K[0-9.]+' | head -1)
+        mem=${mem%%.*}
+        [[ -z "$name" ]] && name="Intel Flex GPU $id"
+        [[ -z "$mem" || "$mem" -le 0 ]] && mem=16384
+        GPU_IDS+=("$id")
+        GPU_NAMES+=("$name")
+        GPU_MEMS+=("$mem")
+        info "GPU $id: $name (${mem} MiB)"
+    done
+
+    if [[ ${#GPU_IDS[@]} -eq 0 ]]; then
+        warn "Could not parse device list, falling back to a single device 0."
+        GPU_IDS=(0); GPU_NAMES=("Intel Flex GPU 0"); GPU_MEMS=(16384)
+    fi
+
+    # Sanity check: can we actually read metrics?
+    local probe
+    probe=$("$XPU_SMI_BIN" stats -d "${GPU_IDS[0]}" 2>/dev/null)
+    if ! echo "$probe" | grep -q 'GPU Utilization'; then
+        warn "'xpu-smi stats -d ${GPU_IDS[0]}' did not return the expected table; values may show as 0."
+    fi
+}
+
+############################ Backup ############################
+function set_backup_directory() {
+    [[ -z "$BACKUP_DIR" ]] && BACKUP_DIR="$HOME/PVE-INTEL-FLEX-DASHBOARD"
+}
+
+function perform_backup() {
+    set_backup_directory
+    mkdir -p "$BACKUP_DIR" || err "Cannot create $BACKUP_DIR"
+    local ts
+    ts=$(date +%Y%m%d_%H%M%S)
+    BACKUP_NODES="$BACKUP_DIR/gpu-dashboard.Nodes.pm.$ts"
+    BACKUP_JS="$BACKUP_DIR/gpu-dashboard.pvemanagerlib.js.$ts"
+    cp "$NODES_PM_FILE" "$BACKUP_NODES" || err "Backup of Nodes.pm failed"
+    cp "$PVE_MANAGER_LIB_JS_FILE" "$BACKUP_JS" || err "Backup of pvemanagerlib.js failed"
+    info "Backups created in $BACKUP_DIR"
+}
+
+function restore_from_current_backup() {
+    [[ -f "$BACKUP_NODES" ]] && cp "$BACKUP_NODES" "$NODES_PM_FILE"
+    [[ -f "$BACKUP_JS" ]] && cp "$BACKUP_JS" "$PVE_MANAGER_LIB_JS_FILE"
+}
+
+function restart_proxy() {
+    if command -v systemctl &>/dev/null; then
+        info "Restarting pveproxy..."
+        systemctl restart pveproxy
+    fi
+}
+
+############################ Root collector service ############################
+# The PVE API (pveproxy) runs as www-data. As that user xpu-smi fails with
+# "Level Zero Initialization Error", so a root service refreshes a cache instead.
+COLLECTOR_BIN="${COLLECTOR_BIN:-/usr/local/bin/pve-xpu-collector.sh}"
+COLLECTOR_UNIT="${COLLECTOR_UNIT:-/etc/systemd/system/pve-xpu-collector.service}"
+
+function install_collector() {
+    msgb "\n=== Installing root collector service ==="
+    local ids="${GPU_IDS[*]}"
+
+    cat > "$COLLECTOR_BIN" << COLLECTOR_EOF
+#!/usr/bin/env bash
+# Generated by pve-intel-flex-dashboard.sh: caches 'xpu-smi stats' for the PVE API.
+XPU_SMI="${XPU_SMI_BIN}"
+IDS="${ids}"
+OUT=/run/pve-xpu
+mkdir -p "\$OUT" && chmod 755 "\$OUT"
+while true; do
+    for id in \$IDS; do
+        if timeout 20 "\$XPU_SMI" stats -d "\$id" > "\$OUT/.stats-\$id.tmp" 2>&1; then :; fi
+        chmod 644 "\$OUT/.stats-\$id.tmp"
+        mv -f "\$OUT/.stats-\$id.tmp" "\$OUT/stats-\$id.txt"
+    done
+    sleep 5
+done
+COLLECTOR_EOF
+    chmod 755 "$COLLECTOR_BIN"
+
+    cat > "$COLLECTOR_UNIT" << UNIT_EOF
+[Unit]
+Description=Cache Intel Flex GPU stats for the Proxmox dashboard
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=${COLLECTOR_BIN}
+Restart=always
+RestartSec=5
+RuntimeDirectory=pve-xpu
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload
+        systemctl enable --now pve-xpu-collector.service || warn "Could not start pve-xpu-collector.service"
+        sleep 3
+        if [[ -s /run/pve-xpu/stats-${GPU_IDS[0]}.txt ]] && grep -q 'GPU Utilization' "/run/pve-xpu/stats-${GPU_IDS[0]}.txt"; then
+            info "Collector running; cache file looks valid."
+        else
+            warn "Collector started but /run/pve-xpu/stats-${GPU_IDS[0]}.txt has no stats table yet:"
+            head -3 "/run/pve-xpu/stats-${GPU_IDS[0]}.txt" 2>/dev/null
+        fi
+    else
+        warn "systemd not available; start $COLLECTOR_BIN manually as root."
+    fi
+}
+
+function remove_collector() {
+    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+        systemctl disable --now pve-xpu-collector.service &>/dev/null
+    fi
+    rm -f "$COLLECTOR_UNIT" "$COLLECTOR_BIN"
+    rm -rf /run/pve-xpu
+    command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]] && systemctl daemon-reload
+}
+
+############################ Backend (Nodes.pm) ############################
+function insert_node_info() {
+    msgb "\n=== Inserting Intel Flex GPU data collection into API ==="
+    local f="/tmp/gpu_perl_code.txt"
+
+    printf '%s\n' "# Intel Flex GPU data for dashboard integration (v4.0)" "{" > "$f"
+    printf "    my \$xpu_smi = '%s';\n" "$XPU_SMI_BIN" >> "$f"
+    printf '%s\n' "    my @gpus = (" >> "$f"
+
+    local n=${#GPU_IDS[@]} i
+    for ((i=0; i<n; i++)); do
+        printf "        { id => %s, name => '%s', mem_mib => %s },\n" \
+            "${GPU_IDS[$i]}" "${GPU_NAMES[$i]}" "${GPU_MEMS[$i]}" >> "$f"
+    done
+
+    cat >> "$f" << 'PERL_TAIL'
+    );
+
+    if (-x $xpu_smi) {
+        $res->{gpuDriverVersion} = 'Intel Flex / xpu-smi';
+        $res->{gpuCudaVersion} = 'N/A';
+
+        my $gpu_index = 0;
+        foreach my $g (@gpus) {
+            my $id = $g->{id};
+            # The API runs as www-data, which cannot initialise Level Zero, so xpu-smi is
+            # run as root by the pve-xpu-collector service and cached in /run/pve-xpu/.
+            my $cache = "/run/pve-xpu/stats-$id.txt";
+            my $stats = '';
+            if (open(my $cfh, '<', $cache)) {
+                local $/;
+                $stats = <$cfh> // '';
+                close($cfh);
+                my $age = time() - (stat($cache))[9];
+                $stats = "Cache file is stale (${age}s old); is pve-xpu-collector running?\n" if $age > 60;
+            } else {
+                $stats = "Cannot read $cache: $!\n";
+            }
+
+            my ($util, $power, $temp, $mem_used_mib) = (0, 0, 0, 0);
+            my %seen;
+            # Rows look like:  | GPU Core Temperature (C) | 41 |
+            # Split on '|' and take the first number in the value cell, so any padding
+            # (spaces, NBSP, tabs) is ignored. "N/A" has no digits and stays 0.
+            foreach my $line (split /\n/, $stats) {
+                my @c = split /\|/, $line;
+                shift @c if @c && $c[0] !~ /\S/;
+                next if @c < 2;
+                my ($k, $v) = @c[0, 1];
+                next unless $v =~ /(\d+(?:\.\d+)?)/;
+                my $num = $1;
+                if    ($k =~ /GPU Utilization/i      && !$seen{u}++) { $util = $num }
+                elsif ($k =~ /GPU Power/i            && !$seen{p}++) { $power = $num }
+                elsif ($k =~ /GPU Core Temperature/i && !$seen{t}++) { $temp = $num }
+                elsif ($k =~ /Memory Used/i          && !$seen{m}++) { $mem_used_mib = $num }
+            }
+
+            # Nothing parsed: keep the raw output so it can be inspected.
+            if (!$seen{u} && !$seen{p} && !$seen{t} && !$seen{m}) {
+                if (open(my $dbg, '>', "/tmp/pve-xpu-debug-$id.txt")) {
+                    print $dbg "uid=$< euid=$>\n--- content read from $cache ---\n", $stats;
+                    close($dbg);
+                }
+            }
+
+            my $mem_used  = $mem_used_mib * 1024 * 1024;
+            my $mem_total = $g->{mem_mib} * 1024 * 1024;
+
+            $res->{"gpu${gpu_index}_name"}        = $g->{name};
+            $res->{"gpu${gpu_index}_temp"}        = $temp + 0;
+            $res->{"gpu${gpu_index}_util"}        = $util + 0;
+            $res->{"gpu${gpu_index}_mem_util"}    = ($mem_total > 0) ? int($mem_used * 100 / $mem_total) : 0;
+            $res->{"gpu${gpu_index}_mem_used"}    = $mem_used + 0;
+            $res->{"gpu${gpu_index}_mem_total"}   = $mem_total + 0;
+            $res->{"gpu${gpu_index}_power_draw"}  = $power + 0;
+            $res->{"gpu${gpu_index}_power_limit"} = 0;
+            $res->{"gpu${gpu_index}_fan"}         = -1;
+            # temp,util,power,power_limit,fan
+            $res->{"gpu${gpu_index}_metrics"}     = join(',', $temp + 0, $util + 0, $power + 0, 0, -1);
+            $gpu_index++;
+        }
+        $res->{gpuCount} = $gpu_index;
+        $res->{gpu_server_time} = time();
+    }
+}
+PERL_TAIL
+
+    perl -i -0777 -pe '
+        BEGIN {
+            open(my $fh, "<", "/tmp/gpu_perl_code.txt") or die "Cannot open temp file: $!";
+            local $/;
+            $::code = <$fh>;
+            close($fh);
+        }
+        s/(my \$dinfo = df\(.*?\);)/$::code\n$1/s;
+    ' "$NODES_PM_FILE"
+    local rc=$?
+    rm -f "$f"
+
+    [[ $rc -ne 0 ]] && return 1
+    grep -q 'gpuDriverVersion' "$NODES_PM_FILE" || return 1
+    info "Data collection code added to $NODES_PM_FILE"
+}
+
+############################ Frontend: status items ############################
+function insert_gpu_dashboard_items() {
+    msgb "\n=== Inserting GPU items into StatusView ==="
+    local f="/tmp/gpu_dashboard_items.js" i name
+    cat > "$f" << 'ITEMS_EOF'
+	{
+	    xtype: 'box',
+	    colspan: 2,
+	    padding: '0 0 20 0',
+	},
+ITEMS_EOF
+
+    for ((i=0; i<${#GPU_IDS[@]}; i++)); do
+        name="${GPU_NAMES[$i]}"
+        cat >> "$f" << ITEM_EOF
+	{
+	    itemId: 'gpu${i}_vram',
+	    iconCls: 'fa fa-fw fa-television',
+	    title: 'GPU ${i}: ${name} VRAM',
+	    valueField: 'gpu${i}_mem_used',
+	    maxField: 'gpu${i}_mem_total',
+	},
+	{
+	    itemId: 'gpu${i}_metrics',
+	    printBar: false,
+	    title: 'GPU ${i} Metrics',
+	    textField: 'gpu${i}_metrics',
+	    renderer: function(value) {
+	        if (!value) return 'No GPU data';
+	        var parts = value.split(',');
+	        if (parts.length < 5) return 'Invalid data';
+	        var temp = parseFloat(parts[0]) || 0;
+	        var gpuUtil = parseFloat(parts[1]) || 0;
+	        var powerDraw = parseFloat(parts[2]) || 0;
+	        var tempStyle = '';
+	        if (temp >= 85) {
+	            tempStyle = 'color: #ff4444; font-weight: bold;';
+	        } else if (temp >= 70) {
+	            tempStyle = 'color: #FFC300; font-weight: bold;';
+	        }
+	        var tempStr = '<span style="' + tempStyle + '">' + temp.toFixed(0) + '°C</span>';
+	        return 'GPU: ' + gpuUtil.toFixed(0) + '% | Temp: ' + tempStr + ' | Power: ' + powerDraw.toFixed(0) + 'W';
+	    },
+	},
+ITEM_EOF
+    done
+
+    perl -i -0777 -pe '
+        BEGIN {
+            open(my $fh, "<", "/tmp/gpu_dashboard_items.js") or die "Cannot open items file: $!";
+            local $/;
+            $::items = <$fh>;
+            close($fh);
+        }
+        s/(itemId:\s*'\''swap'\''.*?\n\s*\},)(\s*\{\s*xtype:\s*'\''box'\'',\s*colspan:\s*2,\s*padding:\s*'\''0 0 20 0'\'')/$1$::items$2/s;
+    ' "$PVE_MANAGER_LIB_JS_FILE"
+    local rc=$?
+    rm -f "$f"
+    [[ $rc -ne 0 ]] && return 1
+    grep -q "itemId: 'gpu0_vram'" "$PVE_MANAGER_LIB_JS_FILE" || return 1
+    info "StatusView items inserted."
+}
+
+############################ Frontend: history charts ############################
+function insert_gpu_history_charts() {
+    msgb "\n=== Inserting GPU history charts ==="
+    local f="/tmp/gpu_history_charts.js" inst="/tmp/gpu_chart_instances.js" i name
+
+    cat > "$f" << CHARTS_HEAD
+// GPU history store (localStorage backed), v4.0
+Ext.define('PVE.data.GPUHistoryStore', {
+    extend: 'Ext.data.Store',
+    alias: 'store.pveGPUHistoryStore',
+
+    statics: {
+        // One shared store (and one poller) per node+GPU, reused by all three charts
+        cache: {},
+        getShared: function(nodename, gpuIndex) {
+            var key = nodename + '-' + gpuIndex;
+            if (!this.cache[key]) {
+                this.cache[key] = Ext.create('PVE.data.GPUHistoryStore', { nodename: nodename, gpuIndex: gpuIndex });
+            }
+            return this.cache[key];
+        }
+    },
+
+    config: {
+        nodename: '',
+        gpuIndex: 0,
+        maxPoints: ${HISTORY_MAX_POINTS},
+        pollInterval: ${HISTORY_POLL_INTERVAL}
+    },
+CHARTS_HEAD
+
+    cat >> "$f" << 'CHARTS_BODY'
+
+    fields: ['time', 'gpu_temp', 'gpu_mem_used', 'gpu_power_draw'],
+
+    constructor: function(config) {
+        var me = this;
+        me.callParent([config]);
+        me.storageKey = 'pve-gpu-rrd-' + me.getNodename() + '-gpu' + me.getGpuIndex();
+        me.loadFromStorage();
+        me.startPolling();
+    },
+
+    loadFromStorage: function() {
+        var me = this;
+        try {
+            var data = localStorage.getItem(me.storageKey);
+            if (data) {
+                var records = JSON.parse(data).map(function(rec) {
+                    if (rec.time && rec.time < 10000000000) { rec.time = rec.time * 1000; }
+                    return rec;
+                });
+                me.loadData(records);
+            }
+        } catch(e) {
+            console.warn('Failed to load GPU history from localStorage:', e);
+        }
+    },
+
+    saveToStorage: function() {
+        var me = this;
+        try {
+            var records = [];
+            me.each(function(rec) {
+                var data = Ext.apply({}, rec.getData());
+                if (data.time && data.time > 10000000000) { data.time = Math.floor(data.time / 1000); }
+                records.push(data);
+            });
+            localStorage.setItem(me.storageKey, JSON.stringify(records));
+        } catch(e) {
+            localStorage.removeItem(me.storageKey);
+        }
+    },
+
+    addDataPoint: function(temp, memUsed, powerDraw, serverTime) {
+        var me = this;
+        me.add({ time: serverTime || Date.now(), gpu_temp: temp, gpu_mem_used: memUsed, gpu_power_draw: powerDraw });
+        while (me.getCount() > me.getMaxPoints()) { me.removeAt(0); }
+        me.saveToStorage();
+    },
+
+    startPolling: function() {
+        var me = this;
+        var poll = function() {
+            Proxmox.Utils.API2Request({
+                url: '/nodes/' + me.getNodename() + '/status',
+                method: 'GET',
+                success: function(response) {
+                    var data = response.result.data;
+                    var idx = me.getGpuIndex();
+                    var temp = data['gpu' + idx + '_temp'];
+                    var memUsed = data['gpu' + idx + '_mem_used'];
+                    var powerDraw = data['gpu' + idx + '_power_draw'];
+                    var serverTime = data.gpu_server_time ? data.gpu_server_time * 1000 : Date.now();
+                    if (temp !== undefined) {
+                        me.addDataPoint(parseFloat(temp) || 0, parseFloat(memUsed) || 0, parseFloat(powerDraw) || 0, serverTime);
+                    }
+                }
+            });
+        };
+        poll();
+        me.pollTask = Ext.TaskManager.start({ run: poll, interval: me.getPollInterval() });
+    },
+
+    destroy: function() {
+        var me = this;
+        if (me.pollTask) { Ext.TaskManager.stop(me.pollTask); }
+        me.callParent();
+    }
+});
+CHARTS_BODY
+
+    perl -i -0777 -pe '
+        BEGIN {
+            open(my $fh, "<", "/tmp/gpu_history_charts.js") or die "Cannot open charts file: $!";
+            local $/;
+            $::chartclass = <$fh>;
+            close($fh);
+        }
+        s/(Ext\.define\('"'"'PVE\.node\.Summary'"'"')/$::chartclass\n\n$1/s;
+    ' "$PVE_MANAGER_LIB_JS_FILE"
+
+    echo "	    // Intel Flex GPU historical charts (v4.0)" > "$inst"
+    for ((i=0; i<${#GPU_IDS[@]}; i++)); do
+        name="${GPU_NAMES[$i]}"
+        cat >> "$inst" << INSTANCE_EOF
+	    {
+	        xtype: 'proxmoxRRDChart',
+	        title: 'GPU ${i} Temperature (${name})',
+	        fields: ['gpu_temp'],
+	        fieldTitles: ['Temperature °C'],
+	        store: PVE.data.GPUHistoryStore.getShared(nodename, ${i})
+	    },
+	    {
+	        xtype: 'proxmoxRRDChart',
+	        title: 'GPU ${i} VRAM Usage',
+	        fields: ['gpu_mem_used'],
+	        fieldTitles: ['VRAM Used'],
+	        unit: 'bytes',
+	        powerOfTwo: true,
+	        store: PVE.data.GPUHistoryStore.getShared(nodename, ${i})
+	    },
+	    {
+	        xtype: 'proxmoxRRDChart',
+	        title: 'GPU ${i} Power Draw',
+	        fields: ['gpu_power_draw'],
+	        fieldTitles: ['Power (W)'],
+	        store: PVE.data.GPUHistoryStore.getShared(nodename, ${i})
+	    },
+INSTANCE_EOF
+    done
+
+    # Same anchor as the NVIDIA v3.0 script: PVE 8 = 'Network traffic', PVE 9 = 'Network Traffic'.
+    perl -i -0777 -pe '
+        BEGIN {
+            open(my $fh, "<", "/tmp/gpu_chart_instances.js") or die "Cannot open instances file: $!";
+            local $/;
+            $::instances = <$fh>;
+            close($fh);
+        }
+        s/(title:\s*gettext\('"'"'Network [Tt]raffic'"'"'\),\s*fields:\s*\['"'"'netin'"'"',\s*'"'"'netout'"'"'\],\s*(?:fieldTitles:\s*\[.*?\],\s*)?store:\s*rrdstore,\s*\},)/$1\n$::instances/s;
+    ' "$PVE_MANAGER_LIB_JS_FILE"
+    local rc=$?
+    rm -f "$f" "$inst"
+    [[ $rc -ne 0 ]] && return 1
+    grep -q "PVE.data.GPUHistoryStore.getShared(nodename" "$PVE_MANAGER_LIB_JS_FILE" || {
+        warn "Could not find the 'Network traffic' chart anchor; charts were not added."
+        return 1
+    }
+    info "History charts inserted."
+}
+
+############################ Install / uninstall ############################
+function install_mod() {
+    msgb "\n=== PVE Intel Flex GPU Dashboard Mod v${SCRIPT_VERSION} ==="
+    check_root_privileges
+
+    if is_installed; then
+        warn "Existing GPU mod found - restoring original files first."
+        uninstall_mod quiet
+    fi
+
+    detect_gpus
+    perform_backup
+    install_collector
+
+    insert_node_info            || { restore_from_current_backup; err "Failed to patch Nodes.pm (restored backup)."; }
+    insert_gpu_dashboard_items   || { restore_from_current_backup; err "Failed to patch StatusView (restored backup)."; }
+    insert_gpu_history_charts    || { restore_from_current_backup; err "Failed to patch charts (restored backup)."; }
+
+    if ! perl -I/usr/share/perl5 -c "$NODES_PM_FILE" >/dev/null 2>/tmp/gpu_perl_check.txt; then
+        cat /tmp/gpu_perl_check.txt
+        restore_from_current_backup
+        err "Perl syntax check of Nodes.pm failed - backups restored."
+    fi
+    rm -f /tmp/gpu_perl_check.txt
+
+    restart_proxy
+    info "Installation completed. Hard-refresh the browser (Ctrl+Shift+R)."
+}
+
+function uninstall_mod() {
+    local quiet="${1:-}"
+    check_root_privileges
+    set_backup_directory
+    [[ -z "$quiet" ]] && msgb "\n=== Uninstalling Intel Flex GPU Dashboard Mod ==="
+
+    if [[ -z "$quiet" ]] && ! is_installed; then
+        err "GPU dashboard mod is not installed."
+    fi
+
+    local n j
+    n=$(find "$BACKUP_DIR" -name "gpu-dashboard.Nodes.pm.*" -type f 2>/dev/null | sort | tail -n 1)
+    j=$(find "$BACKUP_DIR" -name "gpu-dashboard.pvemanagerlib.js.*" -type f 2>/dev/null | sort | tail -n 1)
+
+    if [[ -n "$n" ]]; then cp "$n" "$NODES_PM_FILE" && info "Restored Nodes.pm from $n"
+    else warn "No Nodes.pm backup found (apt install --reinstall pve-manager restores it)."; fi
+    if [[ -n "$j" ]]; then cp "$j" "$PVE_MANAGER_LIB_JS_FILE" && info "Restored pvemanagerlib.js from $j"
+    else warn "No pvemanagerlib.js backup found (apt install --reinstall pve-manager restores it)."; fi
+
+    remove_collector
+    restart_proxy
+    [[ -z "$quiet" ]] && info "Uninstallation completed."
+}
+
+case "${1:-}" in
+    install)   install_mod ;;
+    uninstall) uninstall_mod ;;
+    *)         usage ;;
+esac
